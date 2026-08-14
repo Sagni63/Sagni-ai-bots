@@ -22,7 +22,7 @@ MIN_SCORE = 4
 
 # GOLD ONLY
 SYMBOLS = {
-    "XAU/USD": "XAUUSD=X"
+     "XAU/USD": "GC=F"
 }
 
 
