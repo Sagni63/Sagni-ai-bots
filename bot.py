@@ -457,14 +457,18 @@ def save_journal(journal):
 
 
 # =========================================================
-# CHECK OPEN TRADES
+# CHECK OPEN TRADES (ACCURATE WIN/LOSS)
 # =========================================================
 
 def check_open_trades(journal):
     still_open = []
 
     for trade in journal["open"]:
-        df = get_data(trade["ticker"], "2d", "15m")
+        # የቅርብ ጊዜ የ 1m data ለፈጣን ፍተሻ መጠቀም
+        df = get_data(trade["ticker"], "1d", "1m")
+
+        if df.empty:
+            df = get_data(trade["ticker"], "1d", "15m")
 
         if df.empty:
             still_open.append(trade)
@@ -479,6 +483,7 @@ def check_open_trades(journal):
         result = None
         exit_price = None
 
+        # ትሬዱ ከተከፈተ በኋላ የመጡትን ካንደሎች ብቻ መፈተሽ
         for timestamp, candle in df.iterrows():
             try:
                 candle_time = pd.to_datetime(timestamp, utc=True)
@@ -487,21 +492,25 @@ def check_open_trades(journal):
             except Exception:
                 continue
 
+            c_high = float(candle["High"])
+            c_low = float(candle["Low"])
+
             if trade["direction"] == "BUY":
-                if float(candle["Low"]) <= trade["sl"]:
+                if c_low <= trade["sl"]:
                     result = "LOSS"
                     exit_price = trade["sl"]
                     break
-                if float(candle["High"]) >= trade["tp2"]:
+                elif c_high >= trade["tp2"]:
                     result = "WIN"
                     exit_price = trade["tp2"]
                     break
-            else:
-                if float(candle["High"]) >= trade["sl"]:
+
+            elif trade["direction"] == "SELL":
+                if c_high >= trade["sl"]:
                     result = "LOSS"
                     exit_price = trade["sl"]
                     break
-                if float(candle["Low"]) <= trade["tp2"]:
+                elif c_low <= trade["tp2"]:
                     result = "WIN"
                     exit_price = trade["tp2"]
                     break
@@ -590,7 +599,7 @@ def run_continuous_bot():
         try:
             journal = load_journal()
 
-            # 1. ክፍት ትሬዶችን በየ 30 ሰከንዱ መፈተሽ (Win/Loss በቅጽበት ለማወቅ)
+            # 1. ክፍት ትሬዶችን በየ 30 ሰከንዱ መፈተሽ
             if journal.get("open"):
                 check_open_trades(journal)
                 save_journal(journal)
@@ -620,5 +629,4 @@ def run_continuous_bot():
 
 if __name__ == "__main__":
     run_continuous_bot()
-
           
