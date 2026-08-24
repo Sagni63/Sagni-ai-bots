@@ -12,7 +12,7 @@ import numpy as np
 
 
 # =========================================================
-# SETTINGS - Score 8+ ላይ ብቻ ሲግናል ለመላክ
+# SETTINGS & CONFIGURATIONS
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,12 +21,8 @@ CHAT_ID = os.getenv("CHAT_ID")
 JOURNAL_FILE = "trade_journal.json"
 ERROR_LOG_FILE = "error_log.txt"
 
-# ከፍተኛ ውጤት - እጅግ ጥሩ ሲግናሎች ብቻ
 MIN_SCORE = 8
 
-# =========================================================
-# የገበያ ጥንዶች
-# =========================================================
 SYMBOLS = {
     "XAU/USD": {"ticker": "XAUUSD=X", "type": "commodity", "leverage": 20},
     "BTC/USD": {"ticker": "BTC-USD", "type": "crypto", "leverage": 10},
@@ -58,9 +54,6 @@ TIMEFRAME_CONFIG = {
     }
 }
 
-# =========================================================
-# ሌሎች ቅንጅቶች
-# =========================================================
 SIGNAL_MEMORY = {}
 COOLDOWN_HOURS = 6
 LAST_CLOSED_ENTRY = {}
@@ -70,12 +63,10 @@ MAX_PRICE_CHANGE_PERCENT = 1.0
 RISK_PER_TRADE = 1.0
 MAX_OPEN_TRADES = 2
 
-# ለBTC ልዩ ቅንጅቶች
 BTC_COOLDOWN_HOURS = 4
 BTC_MIN_SCORE = 6
 BTC_MAX_PRICE_CHANGE = 2.0
 
-# ለXAU/USD ልዩ ቅንጅቶች
 XAU_COOLDOWN_HOURS = 6
 XAU_MIN_SCORE = 7
 XAU_MAX_PRICE_CHANGE = 1.5
@@ -85,7 +76,7 @@ SL_PADDING = 0.002
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM & LOGGING
 # =========================================================
 
 def send_telegram(message):
@@ -98,10 +89,7 @@ def send_telegram(message):
     try:
         response = requests.post(
             url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
+            json={"chat_id": CHAT_ID, "text": message},
             timeout=30
         )
         response.raise_for_status()
@@ -123,100 +111,57 @@ def log_error(error_message):
 
 
 # =========================================================
-# MARKET DATA
+# MARKET DATA (FIXED YFINANCE DATA STRUCTURE)
 # =========================================================
 
 def get_data(symbol, period, interval):
+    """
+    yfinance የውሂብ መዋቅር (MultiIndex Columns) ችግር እንዳይፈጥር
+    በጥንቃቄ የተቀረጸ የዳታ መሳቢያ ፋንክሽን።
+    """
     try:
-        try:
-            yf.clear_cache()
-        except:
-            pass
-        
-        cache_dir = os.path.expanduser("~/.cache/py-yfinance")
-        if os.path.exists(cache_dir):
-            try:
-                shutil.rmtree(cache_dir)
-            except:
-                pass
-        
-        if symbol == "GC=F" or symbol == "XAUUSD=X":
-            try:
-                ticker = yf.Ticker(symbol)
-                df = ticker.history(period=period, interval=interval)
-                if not df.empty:
-                    return df
-            except:
-                pass
-        
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False
-        )
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=interval)
+
+        if df.empty and (symbol == "GC=F" or symbol == "XAUUSD=X"):
+            alt_symbol = "XAUUSD=X" if symbol == "GC=F" else "GC=F"
+            ticker = yf.Ticker(alt_symbol)
+            df = ticker.history(period=period, interval=interval)
 
         if df.empty:
-            print(f"❌ No data: {symbol} {interval}")
-            if symbol == "GC=F":
-                print("🔄 Trying alternative ticker XAUUSD=X...")
-                try:
-                    ticker = yf.Ticker("XAUUSD=X")
-                    df = ticker.history(period=period, interval=interval)
-                    if not df.empty:
-                        return df
-                except:
-                    pass
+            df = yf.download(symbol, period=period, interval=interval, progress=False)
+
+        if df.empty:
+            print(f"❌ No data found for {symbol} ({interval})")
             return pd.DataFrame()
 
+        # MultiIndex Column ማስተካከያ (ዋናው ማስተካከያ)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        df.columns = [str(c).title() for c in df.columns]
+        # Columns Standardize ማድረግ (የመጀመሪያ አቢይ ፊደል)
+        df.columns = [str(c).capitalize() for c in df.columns]
 
+        # የሚፈለጉት ዋና የካንድል ኮልሞች መኖራቸውን ማረጋገጥ
         required = ["Open", "High", "Low", "Close"]
-        for col in required:
-            if col not in df.columns:
-                print(f"❌ Missing column: {col}")
-                return pd.DataFrame()
+        missing = [col for col in required if col not in df.columns]
 
-        return df.dropna(subset=required)
+        if missing:
+            print(f"❌ Missing required columns {missing} for {symbol}")
+            return pd.DataFrame()
+
+        # የጎደሉ (NaN) መረጃዎችን ማጽዳት
+        df = df[required].dropna()
+        return df
 
     except Exception as e:
         print(f"❌ Data fetch error ({symbol}): {repr(e)}")
+        log_error(f"get_data error for {symbol}: {repr(e)}")
         return pd.DataFrame()
 
 
-def make_45m(df):
-    if df.empty:
-        return df
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-    return df.resample("45min").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last"
-    }).dropna()
-
-
-def make_4h(df):
-    if df.empty:
-        return df
-    df = df.copy()
-    df.index = pd.to_datetime(df.index)
-    return df.resample("4h").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last"
-    }).dropna()
-
-
 # =========================================================
-# INDICATORS
+# INDICATORS & ANALYSIS
 # =========================================================
 
 def EMA(series, period):
@@ -240,52 +185,33 @@ def ATR(df, period=14):
 def find_pivots(df, lookback=5):
     highs = df["High"]
     lows = df["Low"]
-    
-    pivot_highs = []
-    pivot_lows = []
-    
+    pivot_highs, pivot_lows = [], []
+
     for i in range(lookback, len(df) - lookback):
         if highs.iloc[i] == highs.iloc[i-lookback:i+lookback+1].max():
             pivot_highs.append((df.index[i], highs.iloc[i]))
         if lows.iloc[i] == lows.iloc[i-lookback:i+lookback+1].min():
             pivot_lows.append((df.index[i], lows.iloc[i]))
-    
+
     return pivot_highs, pivot_lows
 
-
-# =========================================================
-# TRENDLINE DETECTION
-# =========================================================
 
 def find_trendlines(df, lookback=30):
     if len(df) < lookback:
         return [], []
-    
     pivot_highs, pivot_lows = find_pivots(df, lookback=3)
-    
-    upper_trendline = []
-    lower_trendline = []
-    
-    if len(pivot_highs) >= 2:
-        p1 = pivot_highs[-2]
-        p2 = pivot_highs[-1]
-        upper_trendline = [p1, p2]
-    
-    if len(pivot_lows) >= 2:
-        p1 = pivot_lows[-2]
-        p2 = pivot_lows[-1]
-        lower_trendline = [p1, p2]
-    
+    upper_trendline = [pivot_highs[-2], pivot_highs[-1]] if len(pivot_highs) >= 2 else []
+    lower_trendline = [pivot_lows[-2], pivot_lows[-1]] if len(pivot_lows) >= 2 else []
     return upper_trendline, lower_trendline
 
 
 def check_trendline_break(df, trendline, direction="UP"):
     if not trendline or len(trendline) < 2:
         return False, None
-    
+
     p1_time, p1_price = trendline[0]
     p2_time, p2_price = trendline[1]
-    
+
     if isinstance(p1_time, pd.Timestamp) and isinstance(p2_time, pd.Timestamp):
         time_diff = (p2_time - p1_time).total_seconds()
         if time_diff == 0:
@@ -293,45 +219,34 @@ def check_trendline_break(df, trendline, direction="UP"):
         slope = (p2_price - p1_price) / time_diff
     else:
         return False, None
-    
+
     last_price = float(df["Close"].iloc[-1])
     last_time = df.index[-1]
     time_diff_last = (last_time - p1_time).total_seconds()
-    
     expected_price = p1_price + slope * time_diff_last
-    
-    if direction == "UP":
-        return last_price > expected_price, expected_price
-    else:
-        return last_price < expected_price, expected_price
 
+    return (last_price > expected_price, expected_price) if direction == "UP" else (last_price < expected_price, expected_price)
 
-# =========================================================
-# SUPPLY & DEMAND ZONES
-# =========================================================
 
 def find_supply_demand_improved(df, lookback=60):
     if len(df) < lookback:
         return [], []
-    
+
     zones = []
     recent = df.tail(lookback)
-    
     ranges = recent["High"] - recent["Low"]
     average_range = ranges.median()
-    
+
     if not np.isfinite(average_range) or average_range <= 0:
         return [], []
-    
+
     for i in range(3, len(recent) - 3):
         base = recent.iloc[i-1:i+2]
         base_range = (base["High"] - base["Low"]).mean()
-        
         previous = recent.iloc[i-2]
         future = recent.iloc[i+2]
-        
         movement = float(future["Close"] - previous["Close"])
-        
+
         if base_range < average_range * 1.3 and movement < -average_range * 1.2:
             zones.append({
                 "type": "SUPPLY",
@@ -346,154 +261,125 @@ def find_supply_demand_improved(df, lookback=60):
                 "high": float(base["High"].max()),
                 "strength": min(10, int(abs(movement) / average_range * 1.5))
             })
-    
+
     return zones[-10:], zones[-5:] if len(zones) > 5 else []
 
 
 def is_near_zone(price, zones, atr_value, direction="BUY"):
     if not zones:
         return None, None
-    
+
     for zone in reversed(zones):
-        low = zone["low"]
-        high = zone["high"]
+        low, high = zone["low"], zone["high"]
         zone_type = zone["type"]
         strength = zone.get("strength", 3)
-        
+
         if low <= price <= high:
             return zone_type, strength
-        
+
         distance = min(abs(price - low), abs(price - high))
         if distance <= atr_value * 0.5:
             return zone_type, strength
-    
+
     return None, None
 
-
-# =========================================================
-# CANDLESTICK PATTERNS
-# =========================================================
 
 def detect_candlestick_patterns(df, direction="BUY"):
     if len(df) < 2:
         return 0, []
-    
-    candle = df.iloc[-1]
-    previous = df.iloc[-2]
-    
-    c_close = float(candle["Close"])
-    c_open = float(candle["Open"])
-    c_high = float(candle["High"])
-    c_low = float(candle["Low"])
-    
-    p_close = float(previous["Close"])
-    p_open = float(previous["Open"])
-    
+
+    candle, previous = df.iloc[-1], df.iloc[-2]
+    c_close, c_open = float(candle["Close"]), float(candle["Open"])
+    c_high, c_low = float(candle["High"]), float(candle["Low"])
+    p_close, p_open = float(previous["Close"]), float(previous["Open"])
+
     body = abs(c_close - c_open)
     body_test = max(body, 0.000001)
-    
     upper_wick = c_high - max(c_open, c_close)
     lower_wick = min(c_open, c_close) - c_low
-    
-    reasons = []
-    score = 0
-    
+
+    reasons, score = [], 0
+
     if direction == "BUY":
         if c_close > c_open and c_high > max(c_open, c_close):
             score += 1
             reasons.append("📈 Bullish Candle")
-        if (c_close > c_open and c_open <= p_close and c_close >= p_open):
+        if c_close > c_open and c_open <= p_close and c_close >= p_open:
             score += 2
             reasons.append("✅ Bullish Engulfing")
-        if (lower_wick >= body_test * 1.2 and upper_wick <= body_test * 0.8):
+        if lower_wick >= body_test * 1.2 and upper_wick <= body_test * 0.8:
             score += 1
             reasons.append("✅ Hammer-like")
     else:
         if c_close < c_open and c_low < min(c_open, c_close):
             score += 1
             reasons.append("📉 Bearish Candle")
-        if (c_close < c_open and c_open >= p_close and c_close <= p_open):
+        if c_close < c_open and c_open >= p_close and c_close <= p_open:
             score += 2
             reasons.append("✅ Bearish Engulfing")
-        if (upper_wick >= body_test * 1.2 and lower_wick <= body_test * 0.8):
+        if upper_wick >= body_test * 1.2 and lower_wick <= body_test * 0.8:
             score += 1
             reasons.append("✅ Shooting Star-like")
-    
+
     return min(score, 4), reasons
 
-
-# =========================================================
-# TREND ANALYSIS
-# =========================================================
 
 def get_trend_improved(df, min_candles=15):
     if len(df) < min_candles:
         return "NEUTRAL", 0
-    
+
     p1 = 10 if len(df) >= 30 else 5
     p2 = 30 if len(df) >= 30 else 10
-    
+
     ema_fast = EMA(df["Close"], p1)
     ema_slow = EMA(df["Close"], p2)
-    
+
     current_fast = float(ema_fast.iloc[-1])
     current_slow = float(ema_slow.iloc[-1])
-    
+
     last_3 = df["Close"].tail(3)
     trend_strength = 0
-    
+
     if len(last_3) >= 3:
         if all(last_3.iloc[i] > last_3.iloc[i-1] for i in range(1, len(last_3))):
             trend_strength += 1
         elif all(last_3.iloc[i] < last_3.iloc[i-1] for i in range(1, len(last_3))):
             trend_strength += 1
-    
+
     if current_fast > current_slow:
         trend_strength += 1
         return "BULLISH", min(trend_strength, 5)
     elif current_fast < current_slow:
         trend_strength += 1
         return "BEARISH", min(trend_strength, 5)
-    
+
     return "NEUTRAL", trend_strength
 
 
-# =========================================================
-# MULTI-TIMEFRAME ANALYSIS
-# =========================================================
-
 def multi_timeframe_analysis(symbol_name, ticker, market_type="forex"):
     config = TIMEFRAME_CONFIG.get(market_type, TIMEFRAME_CONFIG["forex"])
-    timeframes = config
-    
-    data = {}
-    trends = {}
-    strengths = {}
-    
-    for name, (period, interval) in timeframes.items():
+    data, trends, strengths = {}, {}, {}
+
+    for name, (period, interval) in config.items():
         try:
             df = get_data(ticker, period, interval)
             if df.empty:
-                print(f"⚠️ Empty data for {name} ({ticker}) - skipping")
                 continue
             data[name] = df
             trend, strength = get_trend_improved(df)
             trends[name] = trend
             strengths[name] = strength
-        except Exception as e:
-            print(f"⚠️ Error getting {name} data: {repr(e)}")
+        except Exception:
             continue
-    
+
     if not data:
         return None
-    
-    available = list(trends.keys())
+
     higher = [t for t in ["W1", "D1", "H4"] if t in trends]
     bullish_count = sum(1 for t in higher if trends.get(t) == "BULLISH")
     bearish_count = sum(1 for t in higher if trends.get(t) == "BEARISH")
-    
     entry_trend = trends.get("M15", "NEUTRAL")
-    
+
     return {
         "data": data,
         "trends": trends,
@@ -504,111 +390,88 @@ def multi_timeframe_analysis(symbol_name, ticker, market_type="forex"):
     }
 
 
-# =========================================================
-# FIBONACCI
-# =========================================================
-
 def fibonacci_levels(df, lookback=40):
     if len(df) < lookback:
-        return None
-    
+        return 0, None
+
     recent = df.tail(lookback)
-    low = float(recent["Low"].min())
-    high = float(recent["High"].max())
+    low, high = float(recent["Low"].min()), float(recent["High"].max())
     price = float(df["Close"].iloc[-1])
-    
     distance = high - low
+
     if distance <= 0:
-        return None
-    
+        return 0, None
+
     levels = {
         "23.6%": low + distance * 0.236,
         "38.2%": low + distance * 0.382,
         "50.0%": low + distance * 0.500,
         "61.8%": low + distance * 0.618
     }
-    
+
     for name, level in levels.items():
         if abs(price - level) <= distance * 0.03:
             return 1, f"Near Fibonacci {name}"
-    
+
     return 0, None
 
 
 # =========================================================
-# MAIN ANALYSIS
+# MAIN SIGNAL ANALYSIS
 # =========================================================
 
 def analyze_improved(symbol_name, symbol_config):
     try:
         ticker = symbol_config["ticker"]
         market_type = symbol_config["type"]
-        
+
         print(f"\n🔎 Analyzing {symbol_name} ({market_type})...")
-        
+
         is_xau = (symbol_name == "XAU/USD")
         is_btc = (symbol_name == "BTC/USD")
-        
         min_score = XAU_MIN_SCORE if is_xau else (BTC_MIN_SCORE if is_btc else MIN_SCORE)
-        
+
         mta = multi_timeframe_analysis(symbol_name, ticker, market_type)
         if not mta:
-            print("❌ Multi-timeframe analysis failed - no data")
+            print("❌ Multi-timeframe analysis failed")
             return None
-        
+
         data = mta["data"]
         trends = mta["trends"]
         bullish_count = mta["bullish_count"]
         bearish_count = mta["bearish_count"]
         entry_trend = mta["entry_trend"]
-        
+
         if "M15" not in data:
-            print("❌ No M15 data available")
             return None
-        
+
         m15 = data["M15"]
         h1 = data.get("H1", m15)
-        
+
         if len(m15) < 15:
-            print("❌ Not enough M15 candles")
             return None
-        
+
         score = 0
         reasons = []
-        
+
         if entry_trend == "BULLISH":
             direction = "BUY"
         elif entry_trend == "BEARISH":
             direction = "SELL"
         else:
-            if len(m15) >= 5:
-                last_close = float(m15["Close"].iloc[-1])
-                prev_close = float(m15["Close"].iloc[-2])
-                if last_close > prev_close:
-                    direction = "BUY"
-                    entry_trend = "BULLISH"
-                else:
-                    direction = "SELL"
-                    entry_trend = "BEARISH"
-            else:
-                print("❌ Cannot determine direction")
-                return None
-        
-        print(f"📊 Entry direction: {direction}")
-        print(f"   Available trends: {trends}")
-        
-        # 1. HTF ማረጋገጫ
+            last_close = float(m15["Close"].iloc[-1])
+            prev_close = float(m15["Close"].iloc[-2])
+            direction = "BUY" if last_close > prev_close else "SELL"
+
+        # 1. HTF Trend
         if direction == "BUY" and bullish_count >= 1:
             score += 2
             reasons.append(f"✅ HTF Bullish ({bullish_count}/3)")
         elif direction == "SELL" and bearish_count >= 1:
             score += 2
             reasons.append(f"✅ HTF Bearish ({bearish_count}/3)")
-        else:
-            reasons.append("⚠️ HTF neutral")
-            score += 1
-        
-        # 2. H1 ማረጋገጫ
+
+        # 2. H1 Trend
         h1_trend = trends.get("H1", "NEUTRAL")
         if direction == "BUY" and h1_trend == "BULLISH":
             score += 1
@@ -616,120 +479,65 @@ def analyze_improved(symbol_name, symbol_config):
         elif direction == "SELL" and h1_trend == "BEARISH":
             score += 1
             reasons.append("✅ H1 Bearish")
-        else:
-            reasons.append("⚠️ H1 neutral")
-        
-        # 3. Supply & Demand
+
+        # 3. S&D Zones
         supply_zones, demand_zones = find_supply_demand_improved(h1, lookback=60)
         price = float(m15["Close"].iloc[-1])
-        
         atr_series = ATR(m15, period=10)
-        if atr_series.empty:
-            atr_value = 1.0
-        else:
-            atr_value = float(atr_series.iloc[-1])
-            if not np.isfinite(atr_value) or atr_value <= 0:
-                atr_value = 1.0
-        
-        zone_found = False
+        atr_value = float(atr_series.iloc[-1]) if not atr_series.empty else 1.0
+
         if direction == "BUY" and demand_zones:
-            zone_type, zone_strength = is_near_zone(price, demand_zones, atr_value, "BUY")
-            if zone_type == "DEMAND":
-                score += min(zone_strength, 3)
-                reasons.append(f"✅ Near Demand (Strength: {zone_strength}/10)")
-                zone_found = True
+            z_type, z_str = is_near_zone(price, demand_zones, atr_value, "BUY")
+            if z_type == "DEMAND":
+                score += min(z_str, 3)
+                reasons.append(f"✅ Near Demand (Strength: {z_str}/10)")
         elif direction == "SELL" and supply_zones:
-            zone_type, zone_strength = is_near_zone(price, supply_zones, atr_value, "SELL")
-            if zone_type == "SUPPLY":
-                score += min(zone_strength, 3)
-                reasons.append(f"✅ Near Supply (Strength: {zone_strength}/10)")
-                zone_found = True
-        
-        if not zone_found:
-            reasons.append("⚠️ Not near a zone")
-        
-        # 4. Trendline Breakout
+            z_type, z_str = is_near_zone(price, supply_zones, atr_value, "SELL")
+            if z_type == "SUPPLY":
+                score += min(z_str, 3)
+                reasons.append(f"✅ Near Supply (Strength: {z_str}/10)")
+
+        # 4. Trendline
         upper_tl, lower_tl = find_trendlines(m15, lookback=15)
-        tl_broken = False
-        
         if direction == "BUY" and lower_tl:
-            is_broken, expected = check_trendline_break(m15, lower_tl, direction="UP")
+            is_broken, _ = check_trendline_break(m15, lower_tl, "UP")
             if is_broken:
                 score += 1
                 reasons.append("✅ Trendline Breakout UP")
-                tl_broken = True
         elif direction == "SELL" and upper_tl:
-            is_broken, expected = check_trendline_break(m15, upper_tl, direction="DOWN")
+            is_broken, _ = check_trendline_break(m15, upper_tl, "DOWN")
             if is_broken:
                 score += 1
                 reasons.append("✅ Trendline Breakout DOWN")
-                tl_broken = True
-        
-        if not tl_broken:
-            reasons.append("⚠️ No trendline breakout")
-        
-        # 5. ሻማ ቅርጾች
-        candle_score, candle_reasons = detect_candlestick_patterns(m15, direction)
-        score += candle_score
-        reasons.extend(candle_reasons)
-        
-        # 6. ፊቦናቺ
-        fib_score, fib_reason = fibonacci_levels(h1)
-        score += fib_score
-        if fib_reason:
-            reasons.append(fib_reason)
-        
-        print(f"📊 Total Score: {score}/14 (Min: {min_score})")
-        
+
+        # 5. Candlestick & Fibonacci
+        c_score, c_reasons = detect_candlestick_patterns(m15, direction)
+        score += c_score
+        reasons.extend(c_reasons)
+
+        f_score, f_reason = fibonacci_levels(h1)
+        score += f_score
+        if f_reason:
+            reasons.append(f_reason)
+
         if score < min_score:
             print(f"❌ NO TRADE | Score {score} < {min_score}")
             return None
-        
-        # የመግቢያ ነጥቦች ማስላት
+
+        # Entry, SL, TP Calculation
         if direction == "BUY":
-            if demand_zones:
-                entry = demand_zones[-1]["high"] * 1.001
-                sl = demand_zones[-1]["low"] - atr_value * SL_PADDING
-            else:
-                entry = price
-                sl = price - atr_value * 1.2
-            
-            risk = entry - sl
-            if risk <= 0:
-                risk = atr_value * 0.5
-            tp1 = entry + risk * 1.5
-            tp2 = entry + risk * 2.5
-            
+            entry = demand_zones[-1]["high"] * 1.001 if demand_zones else price
+            sl = entry - (atr_value * 1.2)
+            risk = max(entry - sl, atr_value * 0.5)
+            tp1 = entry + (risk * 1.5)
+            tp2 = entry + (risk * 2.5)
         else:
-            if supply_zones:
-                entry = supply_zones[-1]["low"] * 0.999
-                sl = supply_zones[-1]["high"] + atr_value * SL_PADDING
-            else:
-                entry = price
-                sl = price + atr_value * 1.2
-            
-            risk = sl - entry
-            if risk <= 0:
-                risk = atr_value * 0.5
-            tp1 = entry - risk * 1.5
-            tp2 = entry - risk * 2.5
-        
-        zone_info = None
-        if direction == "BUY" and demand_zones:
-            zone_info = {
-                "type": "DEMAND",
-                "low": demand_zones[-1]["low"],
-                "high": demand_zones[-1]["high"],
-                "strength": demand_zones[-1].get("strength", 0)
-            }
-        elif direction == "SELL" and supply_zones:
-            zone_info = {
-                "type": "SUPPLY",
-                "low": supply_zones[-1]["low"],
-                "high": supply_zones[-1]["high"],
-                "strength": supply_zones[-1].get("strength", 0)
-            }
-        
+            entry = supply_zones[-1]["low"] * 0.999 if supply_zones else price
+            sl = entry + (atr_value * 1.2)
+            risk = max(sl - entry, atr_value * 0.5)
+            tp1 = entry - (risk * 1.5)
+            tp2 = entry - (risk * 2.5)
+
         return {
             "symbol": symbol_name,
             "ticker": ticker,
@@ -742,33 +550,30 @@ def analyze_improved(symbol_name, symbol_config):
             "reasons": reasons,
             "timeframe": "M15",
             "time": datetime.now(timezone.utc).isoformat(),
-            "zone": zone_info,
             "atr": atr_value,
             "trends": trends
         }
-    
+
     except Exception as e:
         print(f"❌ Error in analyze_improved: {repr(e)}")
-        log_error(f"analyze_improved for {symbol_name}: {repr(e)}")
+        log_error(f"analyze_improved: {repr(e)}")
         return None
 
 
 # =========================================================
-# JOURNAL
+# JOURNAL MANAGEMENT & TRADE MONITORING
 # =========================================================
 
 def load_journal():
     if not os.path.exists(JOURNAL_FILE):
         return {"open": [], "closed": []}
-
     try:
         with open(JOURNAL_FILE, "r", encoding="utf-8") as file:
             journal = json.load(file)
-        journal.setdefault("open", [])
-        journal.setdefault("closed", [])
-        return journal
-    except Exception as e:
-        print(f"❌ Error loading journal: {repr(e)}")
+            journal.setdefault("open", [])
+            journal.setdefault("closed", [])
+            return journal
+    except Exception:
         return {"open": [], "closed": []}
 
 
@@ -780,17 +585,12 @@ def save_journal(journal):
         print(f"❌ Error saving journal: {repr(e)}")
 
 
-# =========================================================
-# 🆕 CHECK OPEN TRADES - ከT1/T2 ማሳወቂያ ጋር
-# =========================================================
-
 def check_open_trades(journal):
     still_open = []
 
     for trade in journal["open"]:
         try:
             df = get_data(trade["ticker"], "1d", "1m")
-
             if df.empty:
                 df = get_data(trade["ticker"], "1d", "15m")
 
@@ -806,9 +606,8 @@ def check_open_trades(journal):
 
             result = None
             exit_price = None
-            hit_tp1 = False
+            hit_tp1 = trade.get("hit_tp1", False)
             hit_tp2 = False
-            update_sent = False
 
             for timestamp, candle in df.iterrows():
                 try:
@@ -822,36 +621,32 @@ def check_open_trades(journal):
                 c_low = float(candle["Low"])
 
                 if trade["direction"] == "BUY":
-                    # TP2 በመጀመሪያ ይፈተሻል
                     if c_high >= trade["tp2"]:
                         result = "WIN"
                         exit_price = trade["tp2"]
                         hit_tp2 = True
                         break
-                    # TP1 በሁለተኛ ደረጃ
-                    elif c_high >= trade["tp1"]:
-                        result = "WIN"
-                        exit_price = trade["tp1"]
+                    elif c_high >= trade["tp1"] and not hit_tp1:
                         hit_tp1 = True
-                        break
-                    # SL
+                        trade["hit_tp1"] = True
+                        send_telegram(f"🎯 TP1 HIT for {trade['symbol']} BUY at {trade['tp1']:.4f}!")
                     elif c_low <= trade["sl"]:
-                        result = "LOSS"
+                        result = "LOSS" if not hit_tp1 else "PARTIAL WIN"
                         exit_price = trade["sl"]
                         break
-                else:
+
+                else:  # SELL
                     if c_low <= trade["tp2"]:
                         result = "WIN"
                         exit_price = trade["tp2"]
                         hit_tp2 = True
                         break
-                    elif c_low <= trade["tp1"]:
-                        result = "WIN"
-                        exit_price = trade["tp1"]
+                    elif c_low <= trade["tp1"] and not hit_tp1:
                         hit_tp1 = True
-                        break
+                        trade["hit_tp1"] = True
+                        send_telegram(f"🎯 TP1 HIT for {trade['symbol']} SELL at {trade['tp1']:.4f}!")
                     elif c_high >= trade["sl"]:
-                        result = "LOSS"
+                        result = "LOSS" if not hit_tp1 else "PARTIAL WIN"
                         exit_price = trade["sl"]
                         break
 
@@ -861,131 +656,47 @@ def check_open_trades(journal):
                 trade["closed_at"] = datetime.now(timezone.utc).isoformat()
                 trade["hit_tp1"] = hit_tp1
                 trade["hit_tp2"] = hit_tp2
-                
                 journal["closed"].append(trade)
-                LAST_CLOSED_ENTRY[trade["symbol"]] = trade["entry"]
-                LAST_SIGNAL_PRICE[trade["symbol"]] = trade["entry"]
-                
-                # 🆕 T1/T2 ማሳወቂያ - በድምጽ እና በማስጠንቀቂያ
-                if hit_tp1 or hit_tp2:
-                    tp_msg = f"🔊🔊🔊 {trade['symbol']} {trade['direction']} TRADE UPDATE 🔊🔊🔊\n"
-                    if hit_tp2:
-                        tp_msg += f"🎯🎯🎯 TP2 HIT at {trade['tp2']:.4f} 🎉🎉🎉\n"
-                    elif hit_tp1:
-                        tp_msg += f"🎯 TP1 HIT at {trade['tp1']:.4f} ✅\n"
-                    tp_msg += f"📌 Result: {result}\n"
-                    tp_msg += f"📊 Entry: {trade['entry']:.4f} | Exit: {exit_price:.4f}\n"
-                    tp_msg += f"💰 Profit: {abs(exit_price - trade['entry']):.2f} pips"
-                    send_telegram(tp_msg)
-                    print(f"🔊 T1/T2 alert sent for {trade['symbol']}")
-                
-                print(f"📕 CLOSED: {trade['symbol']} = {result}")
+
+                send_telegram(f"📕 CLOSED: {trade['symbol']} {trade['direction']} = {result} at {exit_price:.4f}")
             else:
                 still_open.append(trade)
+
         except Exception as e:
-            print(f"❌ Error checking trade: {repr(e)}")
+            print(f"❌ Error checking open trade: {repr(e)}")
             still_open.append(trade)
 
     journal["open"] = still_open
 
 
-# =========================================================
-# STATISTICS
-# =========================================================
-
-def get_statistics(journal):
-    wins = sum(1 for trade in journal["closed"] if trade.get("result") == "WIN")
-    losses = sum(1 for trade in journal["closed"] if trade.get("result") == "LOSS")
-    total = wins + losses
-    win_rate = (wins / total * 100) if total > 0 else 0
-    
-    # 🆕 T1/T2 ስታቲስቲክስ
-    tp1_hits = sum(1 for trade in journal["closed"] if trade.get("hit_tp1") == True)
-    tp2_hits = sum(1 for trade in journal["closed"] if trade.get("hit_tp2") == True)
-    
-    total_pips = 0
-    for trade in journal["closed"]:
-        if trade.get("exit") and trade.get("entry"):
-            pips = abs(trade["exit"] - trade["entry"])
-            total_pips += pips
-    
-    avg_pips = total_pips / total if total > 0 else 0
-
-    return wins, losses, total, win_rate, avg_pips, tp1_hits, tp2_hits
-
-
-# =========================================================
-# TELEGRAM MESSAGE - ከT1/T2 ሪፖርት ጋር
-# =========================================================
-
-def make_message(signal, journal):
-    wins, losses, total, win_rate, avg_pips, tp1_hits, tp2_hits = get_statistics(journal)
+def make_message(signal):
     confirmation = "\n".join(f"• {reason}" for reason in signal["reasons"])
-    
-    zone_info = ""
-    if signal.get("zone"):
-        z = signal["zone"]
-        zone_info = f"\n📍 {z['type']} Zone: {z['low']:.4f} - {z['high']:.4f} (Strength: {z['strength']}/10)"
-    
-    trend_info = ""
-    if signal.get("trends"):
-        t = signal["trends"]
-        trend_info = f"\n📊 Trends: {', '.join([f'{k}={v}' for k, v in t.items()])}"
-    
-    # 🆕 T1/T2 ሪፖርት
-    tp_report = f"\n🎯 TP1 Hits: {tp1_hits} | TP2 Hits: {tp2_hits}"
-    
-    open_trades_info = ""
-    if journal.get("open"):
-        open_trades_info = f"\n📌 Open Trades: {len(journal['open'])}"
-        for i, trade in enumerate(journal["open"]):
-            open_trades_info += f"\n   {i+1}. {trade['symbol']} {trade['direction']} @ {trade['entry']:.4f}"
-            # 🆕 ክፍት ትሬድ ላይ ያለውን T1/T2 አሳይ
-            if trade.get('tp1') and trade.get('tp2'):
-                open_trades_info += f" (TP1: {trade['tp1']:.4f}, TP2: {trade['tp2']:.4f})"
-    
     return f"""
 🔊🔊🔊 {signal['symbol']} SIGNAL 🔊🔊🔊
 
-📌 {signal["direction"]} — {signal["symbol"]}
+📌 Direction: {signal["direction"]}
 
 📍 Entry: {signal["entry"]:.4f}
 🛑 SL: {signal["sl"]:.4f}
 🎯 TP1: {signal["tp1"]:.4f}
 🎯 TP2: {signal["tp2"]:.4f}
-{zone_info}
-{trend_info}
 
 📊 Score: {signal["score"]}/14
 
 ✅ Confirmation:
 {confirmation}
 
-🏆 PERFORMANCE
-📈 Win Rate: {win_rate:.1f}%
-📊 Total: {total} | ✅ Wins: {wins} | ❌ Losses: {losses}
-📏 Avg: {avg_pips:.1f} pips/trade
-{tp_report}
-{open_trades_info}
-
 ⚠️ Risk: {RISK_PER_TRADE}% per trade
 """.strip()
 
 
 # =========================================================
-# CONTINUOUS BOT LOOP
+# MAIN LOOP
 # =========================================================
 
 def run_continuous_bot():
     print("==========================================")
-    print("🔊🔊🔊 MULTI-MARKET BOT v4.0 (WITH T1/T2 ALERTS) 🔊🔊🔊")
-    print("✅ Markets: XAU/USD, BTC/USD, GBP/USD, USD/JPY")
-    print(f"✅ Min Score: {MIN_SCORE}/14 (BTC: {BTC_MIN_SCORE}, XAU: {XAU_MIN_SCORE})")
-    print(f"✅ Cooldown: {COOLDOWN_HOURS}h (BTC: {BTC_COOLDOWN_HOURS}h, XAU: {XAU_COOLDOWN_HOURS}h)")
-    print(f"✅ Min Price Change: {MIN_PRICE_CHANGE_FOR_SIGNAL}%")
-    print("✅ T1/T2 Alerts: ENABLED 🔊")
-    print("✅ Cache cleared on every request")
-    print("✅ Error logging enabled")
+    print("🔊 TRADING BOT IS RUNNING SUCCESSFULLY...")
     print("==========================================")
 
     while True:
@@ -998,86 +709,30 @@ def run_continuous_bot():
 
             open_count = len(journal.get("open", []))
             if open_count >= MAX_OPEN_TRADES:
-                print(f"⏳ Max open trades: {open_count}/{MAX_OPEN_TRADES}")
-                time.sleep(30)
+                print(f"⏳ Max open trades reached ({open_count}/{MAX_OPEN_TRADES})")
+                time.sleep(60)
                 continue
 
             for symbol_name, symbol_config in SYMBOLS.items():
-                try:
-                    already_open = {trade["symbol"] for trade in journal.get("open", [])}
-
-                    if symbol_name in already_open:
-                        print(f"⏳ Already open: {symbol_name}")
-                        continue
-
-                    is_btc = (symbol_name == "BTC/USD")
-                    is_xau = (symbol_name == "XAU/USD")
-                    
-                    cooldown = XAU_COOLDOWN_HOURS if is_xau else (BTC_COOLDOWN_HOURS if is_btc else COOLDOWN_HOURS)
-                    max_price_change = XAU_MAX_PRICE_CHANGE if is_xau else (BTC_MAX_PRICE_CHANGE if is_btc else MAX_PRICE_CHANGE_PERCENT)
-                    
-                    # Cooldown
-                    last_signal_time = SIGNAL_MEMORY.get(symbol_name)
-                    if last_signal_time:
-                        try:
-                            last_dt = datetime.fromisoformat(last_signal_time)
-                            hours_passed = (datetime.now() - last_dt).total_seconds() / 3600
-                            if hours_passed < cooldown:
-                                print(f"⏳ Cooldown: {symbol_name} ({hours_passed:.1f}h)")
-                                continue
-                        except Exception:
-                            pass
-                    
-                    # Price Gap from last entry
-                    last_entry = LAST_CLOSED_ENTRY.get(symbol_name)
-                    if last_entry:
-                        test_df = get_data(symbol_config["ticker"], "1d", "5m")
-                        if not test_df.empty:
-                            current_price = float(test_df["Close"].iloc[-1])
-                            percent_change = abs((current_price - last_entry) / last_entry * 100)
-                            if percent_change > max_price_change:
-                                print(f"⏳ Price gap: {symbol_name} ({percent_change:.2f}%)")
-                                continue
-                    
-                    # ተመሳሳይ ዋጋ እንዳይደገም
-                    last_signal_price = LAST_SIGNAL_PRICE.get(symbol_name)
-                    if last_signal_price:
-                        test_df = get_data(symbol_config["ticker"], "1d", "5m")
-                        if not test_df.empty:
-                            current_price = float(test_df["Close"].iloc[-1])
-                            percent_change = abs((current_price - last_signal_price) / last_signal_price * 100)
-                            if percent_change < MIN_PRICE_CHANGE_FOR_SIGNAL:
-                                print(f"⏳ Price not changed enough: {symbol_name} ({percent_change:.2f}% < {MIN_PRICE_CHANGE_FOR_SIGNAL}%)")
-                                continue
-
-                    signal = analyze_improved(symbol_name, symbol_config)
-                    if signal:
-                        message = make_message(signal, journal)
-                        if send_telegram(message):
-                            journal["open"].append(signal)
-                            save_journal(journal)
-                            SIGNAL_MEMORY[symbol_name] = datetime.now().isoformat()
-                            LAST_SIGNAL_PRICE[symbol_name] = signal["entry"]
-                            print(f"✅ SIGNAL SENT: {symbol_name} @ {signal['entry']:.4f}")
-                    else:
-                        print(f"⏳ No signal for {symbol_name}")
-
-                except Exception as e:
-                    print(f"❌ Error processing {symbol_name}: {repr(e)}")
-                    log_error(f"Error processing {symbol_name}: {repr(e)}")
+                already_open = {trade["symbol"] for trade in journal.get("open", [])}
+                if symbol_name in already_open:
                     continue
 
-        except Exception as error:
-            print(f"❌ Main loop error: {repr(error)}")
-            log_error(f"Main loop error: {repr(error)}")
+                signal = analyze_improved(symbol_name, symbol_config)
+                if signal:
+                    msg = make_message(signal)
+                    if send_telegram(msg):
+                        journal["open"].append(signal)
+                        save_journal(journal)
+                        print(f"✅ Signal executed for {symbol_name}")
+
             time.sleep(60)
 
-        time.sleep(30)
+        except Exception as e:
+            print(f"❌ Main Loop Error: {repr(e)}")
+            log_error(f"Main Loop: {repr(e)}")
+            time.sleep(10)
 
-
-# =========================================================
-# START
-# =========================================================
 
 if __name__ == "__main__":
     run_continuous_bot()
