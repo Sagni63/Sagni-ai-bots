@@ -18,6 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 JOURNAL_FILE = "trade_journal.json"
+MEMORY_FILE = "signal_memory.json"
 ERROR_LOG_FILE = "error_log.txt"
 
 MAX_OPEN_TRADES = 2
@@ -25,9 +26,7 @@ RISK_PER_TRADE = 1.0
 
 # 🔴 ሲግናል ቶሎ ቶሎ እንዳይልከ የማገጃ ሰዓት (በሰዓት)
 COOLDOWN_HOURS = 4  
-SIGNAL_MEMORY = {}
 
-# 🔴 የ XAUUSD Ticker ወደ XAUUSD=X ተቀይሯል (ከ GC=F ይልቅ)
 SYMBOLS = {
     "XAU/USD": {"ticker": "XAUUSD=X", "type": "commodity"},
     "BTC/USD": {"ticker": "BTC-USD", "type": "crypto"},
@@ -42,7 +41,7 @@ SYMBOLS = {
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print("❌ Telegram BOT_TOKEN or CHAT_ID missing in Environment Variables")
+        print("❌ Telegram BOT_TOKEN or CHAT_ID missing")
         return False
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -61,7 +60,28 @@ def log_error(msg):
 
 
 # =========================================================
-# DATA FETCHING (SAFE YFINANCE)
+# MEMORY MANAGEMENT (PERMANENT COOLDOWN)
+# =========================================================
+
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return {}
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_memory(mem):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(mem, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ Error Saving Memory: {e}")
+
+
+# =========================================================
+# DATA FETCHING
 # =========================================================
 
 def get_data(symbol, period, interval):
@@ -75,7 +95,6 @@ def get_data(symbol, period, interval):
         if df.empty:
             return pd.DataFrame()
 
-        # MultiIndex Column ማስተካከያ
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -112,21 +131,24 @@ def get_trend(df):
 
 
 # =========================================================
-# TECHNICAL ANALYSIS & PRICE SANITY CHECK
+# ANALYSIS & SIGNAL GENERATION
 # =========================================================
 
 def analyze_symbol(symbol_name, symbol_config):
     now = datetime.now(timezone.utc)
+    memory = load_memory()
     
-    # 1. Cooldown Check
-    if symbol_name in SIGNAL_MEMORY:
-        last_sent = SIGNAL_MEMORY[symbol_name]
-        if now - last_sent < timedelta(hours=COOLDOWN_HOURS):
-            return None
+    # 🔴 1. COOLDOWN CHECK (በፋይል የተጠበቀ)
+    if symbol_name in memory:
+        try:
+            last_sent_time = datetime.fromisoformat(memory[symbol_name])
+            if now - last_sent_time < timedelta(hours=COOLDOWN_HOURS):
+                return None
+        except Exception:
+            pass
 
     ticker = symbol_config["ticker"]
     
-    # 🔴 አሁን ያለውን የቀጥታ ዋጋ ከ 1m ዳታ መውሰድ
     live_df = get_data(ticker, "1d", "1m")
     m15 = get_data(ticker, "3d", "15m")
     h1 = get_data(ticker, "14d", "1h")
@@ -134,11 +156,11 @@ def analyze_symbol(symbol_name, symbol_config):
     if live_df.empty or m15.empty or len(m15) < 20:
         return None
 
-    current_price = float(live_df["Close"].iloc[-1]) # ትክክለኛው LIVE PRICE
+    current_price = float(live_df["Close"].iloc[-1])
 
-    # 🔴 Price Safety Filter: የተሳሳተ የወርቅ ዋጋ ከተመለሰ ውድቅ ያደርጋል
+    # 🔴 2. Price Safety Filter
     if symbol_name == "XAU/USD" and (current_price > 3500 or current_price < 1500):
-        print(f"⚠️ Bad Gold Data Detected: {current_price}. Signal Skipped.")
+        print(f"⚠️ Bad Gold Data Detected: {current_price}. Skipped.")
         return None
 
     atr_series = ATR(m15)
@@ -149,12 +171,11 @@ def analyze_symbol(symbol_name, symbol_config):
     m15_trend = get_trend(m15)
     h1_trend = get_trend(h1) if not h1.empty else "NEUTRAL"
 
-    # ሁለቱም Timeframe ካልተስማሙ አይነግድም
     if m15_trend == "NEUTRAL" or m15_trend != h1_trend:
         return None  
 
     direction = "BUY" if m15_trend == "BULLISH" else "SELL"
-    entry = current_price # Entry ሁልጊዜ አሁን ያለው ገበያ ዋጋ ነው
+    entry = current_price
 
     if direction == "BUY":
         sl = entry - (atr_val * 1.5)
@@ -165,8 +186,9 @@ def analyze_symbol(symbol_name, symbol_config):
         tp1 = entry - (atr_val * 1.5)
         tp2 = entry - (atr_val * 3.0)
 
-    # ሲግናል መላኩን መዝግቦ መያዝ
-    SIGNAL_MEMORY[symbol_name] = now
+    # 🔴 3. Cooldown መዝግቦ መያዝ
+    memory[symbol_name] = now.isoformat()
+    save_memory(memory)
 
     return {
         "symbol": symbol_name,
@@ -179,7 +201,7 @@ def analyze_symbol(symbol_name, symbol_config):
         "score": 8,
         "reasons": [
             f"✅ Validated Live Price: {entry:.2f}",
-            f"✅ Trend Alignment ({direction})"
+            f"✅ M15/H1 Trend Alignment ({direction})"
         ],
         "time": now.isoformat()
     }
@@ -262,7 +284,7 @@ Confirmations:
 # =========================================================
 
 def run_bot():
-    print("🤖 Trading Bot Started Safely...")
+    print("🤖 Trading Bot Started Safely (15-Min Intervals)...")
     while True:
         try:
             journal = load_journal()
@@ -274,7 +296,8 @@ def run_bot():
 
             # 2. ከ 2 በላይ ክፍት ትሬድ ካለ አዲስ አትፈልግ
             if len(journal.get("open", [])) >= MAX_OPEN_TRADES:
-                time.sleep(60)
+                print(f"⏳ Max open trades reached. Waiting...")
+                time.sleep(900)
                 continue
 
             # 3. አዲስ ሲግናል ፈልግ
@@ -291,7 +314,8 @@ def run_bot():
                         save_journal(journal)
                         print(f"✅ Real-time Signal Sent for {sym_name}")
 
-            time.sleep(60) # በየ 1 ደቂቃው ገበያውን ይፈትሻል
+            # 🔴 15 ደቂቃ (900 ሰከንድ) ይጠብቃል፤ ቶሎ ቶሎ እንዳይልክ ያደርገዋል
+            time.sleep(900) 
 
         except Exception as e:
             print(f"❌ Main Loop Error: {e}")
