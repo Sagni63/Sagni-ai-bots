@@ -9,7 +9,7 @@ import numpy as np
 
 
 # =========================================================
-# CONFIGURATIONS & GLOBAL SETTINGS
+# CONFIGURATIONS
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -71,7 +71,7 @@ def log_error(msg):
 
 
 # =========================================================
-# MARKET DATA FETCHING & INDICATORS
+# MARKET DATA & INDICATORS
 # =========================================================
 
 def get_data(symbol, period, interval):
@@ -116,7 +116,7 @@ def get_trend(df):
 
 
 # =========================================================
-# TECHNICAL ANALYSIS & FILTERING
+# TECHNICAL ANALYSIS
 # =========================================================
 
 def analyze_symbol(symbol_name, symbol_config):
@@ -128,7 +128,7 @@ def analyze_symbol(symbol_name, symbol_config):
         try:
             last_sent_time = datetime.fromisoformat(memory[symbol_name])
             if now - last_sent_time < timedelta(hours=COOLDOWN_HOURS):
-                print(f"⏳ {symbol_name} is in cooldown.")
+                print(f"⏳ {symbol_name} is in cooldown lock.")
                 return None
         except Exception:
             pass
@@ -180,7 +180,7 @@ def analyze_symbol(symbol_name, symbol_config):
         "tp1": tp1,
         "tp2": tp2,
         "reasons": [
-            f"✅ Validated Price: {entry:.2f}",
+            f"✅ Validated Live Price: {entry:.4f}",
             f"✅ Trend Alignment ({direction})"
         ],
         "time": now.isoformat()
@@ -188,39 +188,51 @@ def analyze_symbol(symbol_name, symbol_config):
 
 
 # =========================================================
-# TRADE MONITORING & JOURNALING
+# MONITORING & COOLDOWN LOCK
 # =========================================================
 
 def check_open_trades():
     journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
+    memory = load_json_file(MEMORY_FILE, {})
     still_open = []
     
     for trade in journal.get("open", []):
+        symbol_name = trade["symbol"]
         df = get_data(trade["ticker"], "1d", "1m")
+        
         if df.empty:
             still_open.append(trade)
             continue
 
-        current_price = float(df["Close"].iloc[-1])
+        last_close = float(df["Close"].iloc[-1])
+        last_low = float(df["Low"].iloc[-1])
+        last_high = float(df["High"].iloc[-1])
+        
         direction = trade["direction"]
         result = None
 
         if direction == "BUY":
-            if current_price >= trade["tp2"]:
+            if last_high >= trade["tp2"]:
                 result = "WIN (TP2)"
-            elif current_price <= trade["sl"]:
+            elif last_low <= trade["sl"]:
                 result = "LOSS (SL)"
         else:
-            if current_price <= trade["tp2"]:
+            if last_low <= trade["tp2"]:
                 result = "WIN (TP2)"
-            elif current_price >= trade["sl"]:
+            elif last_high >= trade["sl"]:
                 result = "LOSS (SL)"
 
         if result:
-            trade["exit"] = current_price
+            trade["exit"] = last_close
             trade["result"] = result
             journal["closed"].append(trade)
-            send_telegram(f"📕 TRADE CLOSED: {trade['symbol']}\nDirection: {direction}\nResult: {result}\nExit Price: {current_price:.4f}")
+            
+            # 🔴 ትሬዱ ሲዘጋ ድጋሚ እንዳይልከው COOLDOWN መቆለፍ
+            memory[symbol_name] = datetime.now(timezone.utc).isoformat()
+            save_json_file(MEMORY_FILE, memory)
+
+            send_telegram(f"📕 CLOSED: {trade['symbol']} {direction} = {result} at {last_close:.4f}")
+            print(f"📕 Closed Trade for {symbol_name}: {result}")
         else:
             still_open.append(trade)
 
@@ -246,7 +258,7 @@ Confirmations:
 
 
 # =========================================================
-# MAIN BOT EXECUTION LOOP
+# MAIN BOT LOOP
 # =========================================================
 
 def run_bot():
@@ -256,14 +268,14 @@ def run_bot():
         try:
             print(f"\n🔎 Scanning Markets at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC...")
 
-            # 1. ክፍት ትሬዶች ካሉ ሁኔታቸውን በ Live Price ፈትሽ
+            # 1. ክፍት ትሬዶች ካሉ ሁኔታቸውን ፈትሽ
             check_open_trades()
 
             journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
             
-            # 2. ከ Max Open Trades በላይ ከሆነ አዲስ አትፈለግ
+            # 2. ክፍት ትሬድ ከሞላ አትፈልግ
             if len(journal.get("open", [])) >= MAX_OPEN_TRADES:
-                print("⏳ Max open trades limit reached. Waiting for next cycle...")
+                print("⏳ Max open trades limit reached.")
             else:
                 # 3. አዲስ ሲግናል ፈልግ
                 for sym_name, sym_config in SYMBOLS.items():
@@ -275,19 +287,17 @@ def run_bot():
                     if sig:
                         msg = make_message(sig)
                         if send_telegram(msg):
-                            # journal ላይ መዝግብ
                             journal["open"].append(sig)
                             save_json_file(JOURNAL_FILE, journal)
                             
-                            # memory (cooldown) ላይ መዝግብ
                             memory = load_json_file(MEMORY_FILE, {})
                             memory[sym_name] = datetime.now(timezone.utc).isoformat()
                             save_json_file(MEMORY_FILE, memory)
                             
                             print(f"✅ Signal SENT and LOCKED for {sym_name}")
 
-            # 🔴 SPAM PROTECTION: በግድ 15 ደቂቃ (900 ሰከንድ) ያርፋል!
-            print("💤 Sleeping for 15 minutes to prevent continuous execution...")
+            # 🔴 15 ደቂቃ ይተኛል
+            print("💤 Sleeping for 15 minutes...")
             time.sleep(900)
 
         except Exception as e:
