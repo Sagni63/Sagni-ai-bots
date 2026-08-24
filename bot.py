@@ -2,8 +2,6 @@ import os
 import json
 import time
 from datetime import datetime, timezone, timedelta
-import traceback
-
 import requests
 import yfinance as yf
 import pandas as pd
@@ -11,7 +9,7 @@ import numpy as np
 
 
 # =========================================================
-# SETTINGS & CONFIGURATIONS
+# CONFIGURATIONS & GLOBAL SETTINGS
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,9 +20,6 @@ MEMORY_FILE = "signal_memory.json"
 ERROR_LOG_FILE = "error_log.txt"
 
 MAX_OPEN_TRADES = 2
-RISK_PER_TRADE = 1.0
-
-# 🔴 ሲግናል ቶሎ ቶሎ እንዳይልከ የማገጃ ሰዓት (በሰዓት)
 COOLDOWN_HOURS = 4  
 
 SYMBOLS = {
@@ -36,7 +31,7 @@ SYMBOLS = {
 
 
 # =========================================================
-# TELEGRAM & LOGGING
+# UTILITIES & FILE MANAGEMENT
 # =========================================================
 
 def send_telegram(message):
@@ -51,37 +46,32 @@ def send_telegram(message):
         print(f"❌ Telegram Error: {e}")
         return False
 
+def load_json_file(filename, default_value):
+    if not os.path.exists(filename):
+        return default_value
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_value
+
+def save_json_file(filename, data):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ File Save Error ({filename}): {e}")
+
 def log_error(msg):
     try:
         with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now().isoformat()}] {msg}\n")
-    except:
+    except Exception:
         pass
 
 
 # =========================================================
-# MEMORY MANAGEMENT (PERMANENT COOLDOWN)
-# =========================================================
-
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
-        return {}
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_memory(mem):
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(mem, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"❌ Error Saving Memory: {e}")
-
-
-# =========================================================
-# DATA FETCHING
+# MARKET DATA FETCHING & INDICATORS
 # =========================================================
 
 def get_data(symbol, period, interval):
@@ -109,11 +99,6 @@ def get_data(symbol, period, interval):
         print(f"❌ Fetch Error ({symbol}): {e}")
         return pd.DataFrame()
 
-
-# =========================================================
-# INDICATORS
-# =========================================================
-
 def EMA(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -131,24 +116,24 @@ def get_trend(df):
 
 
 # =========================================================
-# ANALYSIS & SIGNAL GENERATION
+# TECHNICAL ANALYSIS & FILTERING
 # =========================================================
 
 def analyze_symbol(symbol_name, symbol_config):
     now = datetime.now(timezone.utc)
-    memory = load_memory()
+    memory = load_json_file(MEMORY_FILE, {})
     
-    # 🔴 1. COOLDOWN CHECK (በፋይል የተጠበቀ)
+    # 🔴 1. COOLDOWN CHECK
     if symbol_name in memory:
         try:
             last_sent_time = datetime.fromisoformat(memory[symbol_name])
             if now - last_sent_time < timedelta(hours=COOLDOWN_HOURS):
+                print(f"⏳ {symbol_name} is in cooldown.")
                 return None
         except Exception:
             pass
 
     ticker = symbol_config["ticker"]
-    
     live_df = get_data(ticker, "1d", "1m")
     m15 = get_data(ticker, "3d", "15m")
     h1 = get_data(ticker, "14d", "1h")
@@ -158,9 +143,9 @@ def analyze_symbol(symbol_name, symbol_config):
 
     current_price = float(live_df["Close"].iloc[-1])
 
-    # 🔴 2. Price Safety Filter
+    # 🔴 2. PRICE SAFETY FILTER
     if symbol_name == "XAU/USD" and (current_price > 3500 or current_price < 1500):
-        print(f"⚠️ Bad Gold Data Detected: {current_price}. Skipped.")
+        print(f"⚠️ Bad Price Data Skipped for {symbol_name}: {current_price}")
         return None
 
     atr_series = ATR(m15)
@@ -186,10 +171,6 @@ def analyze_symbol(symbol_name, symbol_config):
         tp1 = entry - (atr_val * 1.5)
         tp2 = entry - (atr_val * 3.0)
 
-    # 🔴 3. Cooldown መዝግቦ መያዝ
-    memory[symbol_name] = now.isoformat()
-    save_memory(memory)
-
     return {
         "symbol": symbol_name,
         "ticker": ticker,
@@ -198,38 +179,23 @@ def analyze_symbol(symbol_name, symbol_config):
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "score": 8,
         "reasons": [
-            f"✅ Validated Live Price: {entry:.2f}",
-            f"✅ M15/H1 Trend Alignment ({direction})"
+            f"✅ Validated Price: {entry:.2f}",
+            f"✅ Trend Alignment ({direction})"
         ],
         "time": now.isoformat()
     }
 
 
 # =========================================================
-# JOURNAL & LIVE MONITORING
+# TRADE MONITORING & JOURNALING
 # =========================================================
 
-def load_journal():
-    if not os.path.exists(JOURNAL_FILE):
-        return {"open": [], "closed": []}
-    try:
-        with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {"open": [], "closed": []}
-
-def save_journal(j):
-    try:
-        with open(JOURNAL_FILE, "w", encoding="utf-8") as f:
-            json.dump(j, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"❌ Error Saving Journal: {e}")
-
-def check_open_trades(journal):
+def check_open_trades():
+    journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
     still_open = []
-    for trade in journal["open"]:
+    
+    for trade in journal.get("open", []):
         df = get_data(trade["ticker"], "1d", "1m")
         if df.empty:
             still_open.append(trade)
@@ -259,7 +225,7 @@ def check_open_trades(journal):
             still_open.append(trade)
 
     journal["open"] = still_open
-
+    save_json_file(JOURNAL_FILE, journal)
 
 def make_message(signal):
     reasons_str = "\n".join(signal["reasons"])
@@ -280,47 +246,54 @@ Confirmations:
 
 
 # =========================================================
-# MAIN BOT LOOP
+# MAIN BOT EXECUTION LOOP
 # =========================================================
 
 def run_bot():
-    print("🤖 Trading Bot Started Safely (15-Min Intervals)...")
+    print("🤖 Trading Bot Started Safely (Strict 15-Minute Loop)...")
+    
     while True:
         try:
-            journal = load_journal()
+            print(f"\n🔎 Scanning Markets at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC...")
+
+            # 1. ክፍት ትሬዶች ካሉ ሁኔታቸውን በ Live Price ፈትሽ
+            check_open_trades()
+
+            journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
             
-            # 1. ክፍት ትሬዶችን በ Live Price ፈትሽ
-            if journal.get("open"):
-                check_open_trades(journal)
-                save_journal(journal)
-
-            # 2. ከ 2 በላይ ክፍት ትሬድ ካለ አዲስ አትፈልግ
+            # 2. ከ Max Open Trades በላይ ከሆነ አዲስ አትፈለግ
             if len(journal.get("open", [])) >= MAX_OPEN_TRADES:
-                print(f"⏳ Max open trades reached. Waiting...")
-                time.sleep(900)
-                continue
+                print("⏳ Max open trades limit reached. Waiting for next cycle...")
+            else:
+                # 3. አዲስ ሲግናል ፈልግ
+                for sym_name, sym_config in SYMBOLS.items():
+                    open_symbols = [t["symbol"] for t in journal.get("open", [])]
+                    if sym_name in open_symbols:
+                        continue
 
-            # 3. አዲስ ሲግናል ፈልግ
-            for sym_name, sym_config in SYMBOLS.items():
-                open_symbols = [t["symbol"] for t in journal.get("open", [])]
-                if sym_name in open_symbols:
-                    continue
+                    sig = analyze_symbol(sym_name, sym_config)
+                    if sig:
+                        msg = make_message(sig)
+                        if send_telegram(msg):
+                            # journal ላይ መዝግብ
+                            journal["open"].append(sig)
+                            save_json_file(JOURNAL_FILE, journal)
+                            
+                            # memory (cooldown) ላይ መዝግብ
+                            memory = load_json_file(MEMORY_FILE, {})
+                            memory[sym_name] = datetime.now(timezone.utc).isoformat()
+                            save_json_file(MEMORY_FILE, memory)
+                            
+                            print(f"✅ Signal SENT and LOCKED for {sym_name}")
 
-                sig = analyze_symbol(sym_name, sym_config)
-                if sig:
-                    msg = make_message(sig)
-                    if send_telegram(msg):
-                        journal["open"].append(sig)
-                        save_journal(journal)
-                        print(f"✅ Real-time Signal Sent for {sym_name}")
-
-            # 🔴 15 ደቂቃ (900 ሰከንድ) ይጠብቃል፤ ቶሎ ቶሎ እንዳይልክ ያደርገዋል
-            time.sleep(900) 
+            # 🔴 SPAM PROTECTION: በግድ 15 ደቂቃ (900 ሰከንድ) ያርፋል!
+            print("💤 Sleeping for 15 minutes to prevent continuous execution...")
+            time.sleep(900)
 
         except Exception as e:
             print(f"❌ Main Loop Error: {e}")
             log_error(str(e))
-            time.sleep(10)
+            time.sleep(60)
 
 if __name__ == "__main__":
     run_bot()
