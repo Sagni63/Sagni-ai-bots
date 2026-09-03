@@ -3,10 +3,9 @@ import json
 import time
 from datetime import datetime, timezone, timedelta
 import requests
-import yfinance as yf
 import pandas as pd
 import numpy as np
-
+import MetaTrader5 as mt5
 
 # =========================================================
 # CONFIGURATIONS
@@ -22,11 +21,12 @@ ERROR_LOG_FILE = "error_log.txt"
 MAX_OPEN_TRADES = 2
 COOLDOWN_HOURS = 4  
 
+# የ MT5 Ticker Symbols Mapping (እንደ ብሮከርህ ስም ማስተካከል ትችላለህ)
 SYMBOLS = {
-    "XAU/USD": {"ticker": "XAUUSD=X", "type": "commodity"},
-    "BTC/USD": {"ticker": "BTC-USD", "type": "crypto"},
-    "GBP/USD": {"ticker": "GBPUSD=X", "type": "forex"},
-    "USD/JPY": {"ticker": "USDJPY=X", "type": "forex"}
+    "XAU/USD": {"mt5_symbol": "XAUUSD", "type": "commodity"},
+    "BTC/USD": {"mt5_symbol": "BTCUSD", "type": "crypto"},
+    "GBP/USD": {"mt5_symbol": "GBPUSD", "type": "forex"},
+    "USD/JPY": {"mt5_symbol": "USDJPY", "type": "forex"}
 }
 
 
@@ -71,33 +71,28 @@ def log_error(msg):
 
 
 # =========================================================
-# MARKET DATA & INDICATORS
+# METATRADER 5 DATA & INDICATORS
 # =========================================================
 
-def get_data(symbol, period, interval):
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
-
-        if df.empty:
-            df = yf.download(symbol, period=period, interval=interval, progress=False)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df.columns = [str(c).capitalize() for c in df.columns]
-        required = ["Open", "High", "Low", "Close"]
-        
-        if not all(col in df.columns for col in required):
-            return pd.DataFrame()
-
-        return df[required].dropna()
-    except Exception as e:
-        print(f"❌ Fetch Error ({symbol}): {e}")
+def get_mt5_data(mt5_symbol, tf_str, count=100):
+    """ከ MT5 በቀጥታ ያለ ምንም መዘገየት መረጃ መውሰጃ"""
+    tf_map = {
+        "1m": mt5.TIMEFRAME_M1,
+        "15m": mt5.TIMEFRAME_M15,
+        "1h": mt5.TIMEFRAME_H1,
+        "1d": mt5.TIMEFRAME_D1
+    }
+    timeframe = tf_map.get(tf_str, mt5.TIMEFRAME_M15)
+    
+    rates = mt5.copy_rates_from_pos(mt5_symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
         return pd.DataFrame()
+
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+    
+    return df[['Open', 'High', 'Low', 'Close']].dropna()
 
 def EMA(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -133,10 +128,10 @@ def analyze_symbol(symbol_name, symbol_config):
         except Exception:
             pass
 
-    ticker = symbol_config["ticker"]
-    live_df = get_data(ticker, "1d", "1m")
-    m15 = get_data(ticker, "3d", "15m")
-    h1 = get_data(ticker, "14d", "1h")
+    mt5_symbol = symbol_config["mt5_symbol"]
+    live_df = get_mt5_data(mt5_symbol, "1m", 10)
+    m15 = get_mt5_data(mt5_symbol, "15m", 100)
+    h1 = get_mt5_data(mt5_symbol, "1h", 100)
 
     if live_df.empty or m15.empty or len(m15) < 20:
         return None
@@ -144,7 +139,7 @@ def analyze_symbol(symbol_name, symbol_config):
     current_price = float(live_df["Close"].iloc[-1])
 
     # 🔴 2. PRICE SAFETY FILTER
-    if symbol_name == "XAU/USD" and (current_price > 3500 or current_price < 1500):
+    if symbol_name == "XAU/USD" and (current_price > 4000 or current_price < 1500):
         print(f"⚠️ Bad Price Data Skipped for {symbol_name}: {current_price}")
         return None
 
@@ -173,14 +168,14 @@ def analyze_symbol(symbol_name, symbol_config):
 
     return {
         "symbol": symbol_name,
-        "ticker": ticker,
+        "mt5_symbol": mt5_symbol,
         "direction": direction,
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "reasons": [
-            f"✅ Validated Live Price: {entry:.4f}",
+            f"✅ Real-Time MT5 Price: {entry:.4f}",
             f"✅ Trend Alignment ({direction})"
         ],
         "time": now.isoformat()
@@ -198,7 +193,7 @@ def check_open_trades():
     
     for trade in journal.get("open", []):
         symbol_name = trade["symbol"]
-        df = get_data(trade["ticker"], "1d", "1m")
+        df = get_mt5_data(trade["mt5_symbol"], "1m", 5)
         
         if df.empty:
             still_open.append(trade)
@@ -262,48 +257,64 @@ Confirmations:
 # =========================================================
 
 def run_bot():
-    print("🤖 Trading Bot Started Safely (Strict 15-Minute Loop)...")
+    print("🤖 Trading Bot Starting with MT5 Real-Time Feed...")
     
-    while True:
-        try:
-            print(f"\n🔎 Scanning Markets at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC...")
+    # MT5 ን ማስጀመር
+    if not mt5.initialize():
+        print("❌ MT5 Initialization Failed! MT5 App ክፍት መሆኑን ያረጋግጡ። Error:", mt5.last_error())
+        return
+    else:
+        print("✅ MT5 Connected Successfully!")
 
-            # 1. ክፍት ትሬዶች ካሉ ሁኔታቸውን ፈትሽ
+    last_scan_time = 0
+    scan_interval = 900  # 15 ደቂቃ (በሰከንድ)
+
+    try:
+        while True:
+            current_timestamp = time.time()
+
+            # 1. ክፍት ትሬዶች ካሉ በየ 15 ሰከንዱ ፈጣን ፍተሻ ያደርጋል
             check_open_trades()
 
-            journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
-            
-            # 2. ክፍት ትሬድ ከሞላ አትፈልግ
-            if len(journal.get("open", [])) >= MAX_OPEN_TRADES:
-                print("⏳ Max open trades limit reached.")
-            else:
-                # 3. አዲስ ሲግናል ፈልግ
-                for sym_name, sym_config in SYMBOLS.items():
-                    open_symbols = [t["symbol"] for t in journal.get("open", [])]
-                    if sym_name in open_symbols:
-                        continue
+            # 2. አዳዲስ ሲግናሎችን በየ 15 ደቂቃው ብቻ ይቃኛል
+            if current_timestamp - last_scan_time >= scan_interval:
+                print(f"\n🔎 Scanning Markets Real-Time at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC...")
+                
+                journal = load_json_file(JOURNAL_FILE, {"open": [], "closed": []})
+                
+                if len(journal.get("open", [])) >= MAX_OPEN_TRADES:
+                    print("⏳ Max open trades limit reached.")
+                else:
+                    for sym_name, sym_config in SYMBOLS.items():
+                        open_symbols = [t["symbol"] for t in journal.get("open", [])]
+                        if sym_name in open_symbols:
+                            continue
 
-                    sig = analyze_symbol(sym_name, sym_config)
-                    if sig:
-                        msg = make_message(sig)
-                        if send_telegram(msg):
-                            journal["open"].append(sig)
-                            save_json_file(JOURNAL_FILE, journal)
-                            
-                            memory = load_json_file(MEMORY_FILE, {})
-                            memory[sym_name] = datetime.now(timezone.utc).isoformat()
-                            save_json_file(MEMORY_FILE, memory)
-                            
-                            print(f"✅ Signal SENT and LOCKED for {sym_name}")
+                        sig = analyze_symbol(sym_name, sym_config)
+                        if sig:
+                            msg = make_message(sig)
+                            if send_telegram(msg):
+                                journal["open"].append(sig)
+                                save_json_file(JOURNAL_FILE, journal)
+                                
+                                memory = load_json_file(MEMORY_FILE, {})
+                                memory[sym_name] = datetime.now(timezone.utc).isoformat()
+                                save_json_file(MEMORY_FILE, memory)
+                                
+                                print(f"✅ Signal SENT and LOCKED for {sym_name}")
 
-            # 🔴 15 ደቂቃ ይተኛል
-            print("💤 Sleeping for 15 minutes...")
-            time.sleep(900)
+                last_scan_time = current_timestamp
 
-        except Exception as e:
-            print(f"❌ Main Loop Error: {e}")
-            log_error(str(e))
-            time.sleep(60)
+            # በየ 15 ሰከንዱ የ SL/TP ሁኔታዎችን ፈጥኖ እንዲፈትሽ አጭር ዕረፍት ያደርጋል
+            time.sleep(15)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Bot Stopped Manually.")
+    except Exception as e:
+        print(f"❌ Main Loop Error: {e}")
+        log_error(str(e))
+    finally:
+        mt5.shutdown()
 
 if __name__ == "__main__":
     run_bot()
